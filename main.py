@@ -12,8 +12,12 @@ import traceback
 import logging
 from datetime import datetime
 from dateutil import parser
+import geopandas as gpd
+import os
+import duckdb
+import aiosqlite
 
-MASTER_PATH = "/Users/isaacadjei/Library/Mobile Documents/com~apple~CloudDocs/Clinical Trial/Clinical-Trial/"
+MASTER_PATH = "C:/Users/Asus/Downloads/Clinical-Trial-main/Clinical-Trial-main/"
 CSV_FILE_NAME = "DATA.csv"
 ERROR_FILE_NAME = "ERRORS"
 STUDY_ID_FILE_NAME = "study_ids.txt"
@@ -24,9 +28,25 @@ PROCESSED_IDS_FILE_NAME = "PROCESSED.txt"
 LOCATION_DATABASE_FILE_NAME = "LocationDatabase.db"
 ERROR_IDS_FILE_NAME = "ERROR_IDS.txt"
 
-GOOGLE_API_KEY = "GOOGLE API KEY"
+
+MERGED_FILE_PARQUET = "merged_census_blocks.parquet"
+
+GOOGLE_API_KEY = "AIzaSyA2wQnd8o8RtP5JBo5xHW2W2okQIFXXamI"
+
+DEMOGRAPHIC_DICT = {}
+PROCESSED_STATES= set()
 
 address_latlng_map = {}
+
+def load_census_data():
+    """
+    Loads the Census block data from the existing Parquet file.
+    """
+    if not os.path.exists(MERGED_FILE_PARQUET):
+        raise FileNotFoundError(f"🚨 Parquet file not found at {MERGED_FILE_PARQUET}. Please check the file path.")
+
+    print("\n📂 Loading merged Census block dataset from Parquet...")
+    return gpd.read_parquet(MERGED_FILE_PARQUET)
 
 def validate_address_with_google(address):
     """
@@ -53,6 +73,8 @@ def validate_address_with_google(address):
             return "Invalid address or no matches found.", None
     except requests.exceptions.RequestException as e:
         return f"An error occurred while making the Google API request: {e}", None
+
+
 
 
 def get_urban_rural_status_by_coords(lat, lng):
@@ -304,6 +326,7 @@ def insert_data_into_location_db(address, all_totals):
 
 
 def EXTRACT_STUDIES_DATA(GET_API_DATA, LINK):
+    global PROCESSED_STATES
     """
     Extracts all data for a single study. 
     Also times how long it takes to process the entire study 
@@ -428,7 +451,38 @@ def EXTRACT_STUDIES_DATA(GET_API_DATA, LINK):
         else:
             address_part = input_text.strip()
         return address_part
+      
 
+
+    def get_blocks_in_radius_locally(parquet_path, lat, lng, radius_miles=67):
+        print("processing for this location")
+        """Query merged Parquet for blocks within radius using Haversine."""
+        print(lat, lng)
+        lat_range = radius_miles / 69
+        lng_range = radius_miles / (69 * math.cos(math.radians(lat)))
+        
+        query = f"""
+        SELECT STATEFP20, COUNTYFP20, TRACTCE20, BLOCKCE20
+        FROM (
+            SELECT STATEFP20, COUNTYFP20, TRACTCE20, BLOCKCE20,
+                (3959 * acos(
+                    cos(radians({lat})) * cos(radians(CAST(INTPTLAT20 AS DOUBLE))) * 
+                    cos(radians(CAST(INTPTLON20 AS DOUBLE)) - radians({lng})) + 
+                    sin(radians({lat})) * sin(radians(CAST(INTPTLAT20 AS DOUBLE)))
+                )) AS distance
+            FROM '{parquet_path}'
+            WHERE CAST(INTPTLAT20 AS DOUBLE) BETWEEN {lat - lat_range} AND {lat + lat_range}
+            AND CAST(INTPTLON20 AS DOUBLE) BETWEEN {lng - lng_range} AND {lng + lng_range}
+        ) 
+        WHERE distance <= {radius_miles};
+        """
+        duckdb.execute("PRAGMA threads=12")
+
+        
+        df = duckdb.query(query).to_df()
+
+        return df
+    
     async def get_geocode_data(session, place_name, api_key):
         base_url = "https://maps.googleapis.com/maps/api/geocode/json"
         params = {"address": place_name, "key": api_key}
@@ -467,114 +521,6 @@ def EXTRACT_STUDIES_DATA(GET_API_DATA, LINK):
             results = await asyncio.gather(*tasks)
             return results
 
-    def getting_the_lats_and_longs_within_radius(lat, lng, radius_in_miles):
-        radius = radius_in_miles * 1.60934
-
-        def is_point_within_radius(center_latitude, center_longitude, 
-                                   point_latitude, point_longitude, rad):
-            lat1, lon1, lat2, lon2 = map(math.radians, [
-                center_latitude, center_longitude, point_latitude, point_longitude
-            ])
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = math.sin(dlat / 2)**2 + \
-                math.cos(lat1)*math.cos(lat2)*math.sin(dlon / 2)**2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-            distance = 6371 * c
-            return distance <= rad
-
-        def generate_points_within_radius(center_latitude, center_longitude, rad, step=0.1):
-            latitudes = [lat]
-            longitudes = [lng]
-
-            min_latitude = center_latitude - math.degrees(rad / 6371)
-            max_latitude = center_latitude + math.degrees(rad / 6371)
-            min_longitude = center_longitude - math.degrees(
-                rad / 6371 / math.cos(math.radians(center_latitude))
-            )
-            max_longitude = center_longitude + math.degrees(
-                rad / 6371 / math.cos(math.radians(center_latitude))
-            )
-
-            current_lat = min_latitude
-            while current_lat <= max_latitude:
-                current_lon = min_longitude
-                while current_lon <= max_longitude:
-                    if is_point_within_radius(center_latitude, center_longitude, 
-                                              current_lat, current_lon, rad):
-                        latitudes.append(current_lat)
-                        longitudes.append(current_lon)
-                    current_lon += step
-                current_lat += step
-
-            return list(zip(latitudes, longitudes))
-
-        return generate_points_within_radius(lat, lng, radius, step=0.1)
-
-    max_delay = 300 
-
-    def is_504_or_502_error(exception):
-        return (isinstance(exception, Exception) and 
-                ('504' in str(exception) or '502' in str(exception)))
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-    @retry(wait=wait_exponential(multiplier=1, min=4, max=max_delay),
-           stop=stop_after_delay(max_delay),
-           retry=retry_if_exception(is_504_or_502_error))
-    async def fetch_codes(session, semaphore, pair):
-        base_url = "https://geocoding.geo.census.gov/geocoder/geographies/coordinates"
-        lat, lng = pair
-        params = {
-            "x": lng,
-            "y": lat,
-            "benchmark": "Public_AR_Current",
-            "vintage": "Current_Current",
-            "format": "json"
-        }
-        async with semaphore:
-            try:
-                async with session.get(base_url, params=params) as response:
-                    if response.status != 200:
-                        raise Exception(f'HTTP error: {response.status}')
-                    if response.content_type != 'application/json':
-                        raise Exception(
-                            f"Expected JSON response but got '{response.content_type}'. "
-                            f"Status: {response.status}"
-                        )
-
-                    data = await response.json()
-                    if ('result' in data and
-                        'geographies' in data['result'] and
-                        '2020 Census Blocks' in data['result']['geographies']):
-                        block_data = data['result']['geographies']['2020 Census Blocks'][0]
-                        state = block_data['STATE']
-                        county = block_data['COUNTY']
-                        tract = block_data['TRACT']
-                        block = block_data['BLOCK']
-                        return (state, county, tract, block)
-                    else:
-                        return None
-            except Exception as e:
-                raise
-
-    async def get_geography_codes(lat_lng_pairs):
-        geography_codes = set()
-        semaphore = asyncio.Semaphore(20)
-        async with aiohttp.ClientSession() as session:
-            tasks = []
-            for pair in lat_lng_pairs:
-                task = fetch_codes(session, semaphore, pair)
-                tasks.append(task)
-            try:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for result in results:
-                    if isinstance(result, Exception):
-                        pass
-                    elif result is not None:
-                        geography_codes.add(result)
-                return geography_codes
-            except Exception as e:
-                return None
 
     TOTAL_WHITES = 0
     TOTAL_WHITES_MALES = 0
@@ -630,7 +576,7 @@ def EXTRACT_STUDIES_DATA(GET_API_DATA, LINK):
 
     # ---------------------------------------------
     #   2010 columns => 21 real + 4 "fake" Hispanic
-    # ---------------------------------------------
+    # ---------------------------------------------6
     race_columns_2010_real = [
         # White totals and M/F
         "P003002",   # TOTAL WHITES
@@ -713,6 +659,112 @@ def EXTRACT_STUDIES_DATA(GET_API_DATA, LINK):
         "P12H_002N", # possibly male hispanic
         "P12H_026N"  # possibly female hispanic
     ]
+    us_states_fips = {
+        "alabama": "01",
+        "alaska": "02",
+        "arizona": "04",
+        "arkansas": "05",
+        "california": "06",
+        "colorado": "08",
+        "connecticut": "09",
+        "delaware": "10",
+        "florida": "12",
+        "georgia": "13",
+        "hawaii": "15",
+        "idaho": "16",
+        "illinois": "17",
+        "indiana": "18",
+        "iowa": "19",
+        "kansas": "20",
+        "kentucky": "21",
+        "louisiana": "22",
+        "maine": "23",
+        "maryland": "24",
+        "massachusetts": "25",
+        "michigan": "26",
+        "minnesota": "27",
+        "mississippi": "28",
+        "missouri": "29",
+        "montana": "30",
+        "nebraska": "31",
+        "nevada": "32",
+        "new hampshire": "33",
+        "new jersey": "34",
+        "new mexico": "35",
+        "new york": "36",
+        "north carolina": "37",
+        "north dakota": "38",
+        "ohio": "39",
+        "oklahoma": "40",
+        "oregon": "41",
+        "pennsylvania": "42",
+        "rhode island": "44",
+        "south carolina": "45",
+        "south dakota": "46",
+        "tennessee": "47",
+        "texas": "48",
+        "utah": "49",
+        "vermont": "50",
+        "virginia": "51",
+        "washington": "53",
+        "west virginia": "54",
+        "wisconsin": "55",
+        "wyoming": "56"
+    }
+
+    neighboring_states_fips = {
+        "01": ["28", "47", "13", "12", "22"],  # Alabama (AL)
+        "02": [],  # Alaska (AK) - No neighbors
+        "04": ["06", "32", "49", "08", "35"],  # Arizona (AZ)
+        "05": ["29", "47", "28", "22", "48"],  # Arkansas (AR)
+        "06": ["41", "32", "04", "49", "16"],  # California (CA)
+        "08": ["56", "31", "20", "40", "35"],  # Colorado (CO)
+        "09": ["36", "25", "44", "34", "42"],  # Connecticut (CT)
+        "10": ["24", "42", "34", "51", "11"],  # Delaware (DE)
+        "12": ["13", "01", "28", "45", "22"],  # Florida (FL)
+        "13": ["01", "47", "37", "45", "12"],  # Georgia (GA)
+        "15": [],  # Hawaii (HI) - No neighbors
+        "16": ["53", "41", "32", "49", "30"],  # Idaho (ID)
+        "17": ["55", "19", "29", "21", "18"],  # Illinois (IL)
+        "18": ["17", "21", "39", "26", "55"],  # Indiana (IN)
+        "19": ["27", "55", "17", "29", "31"],  # Iowa (IA)
+        "20": ["31", "29", "40", "08", "48"],  # Kansas (KS)
+        "21": ["39", "18", "17", "29", "47"],  # Kentucky (KY)
+        "22": ["48", "05", "28", "01", "12"],  # Louisiana (LA)
+        "23": ["33", "50", "25", "36", "44"],  # Maine (ME)
+        "24": ["42", "10", "34", "51", "54"],  # Maryland (MD)
+        "25": ["33", "50", "36", "44", "09"],  # Massachusetts (MA)
+        "26": ["39", "18", "17", "55", "27"],  # Michigan (MI)
+        "27": ["38", "46", "19", "55", "26"],  # Minnesota (MN)
+        "28": ["22", "05", "47", "01", "13"],  # Mississippi (MS)
+        "29": ["31", "19", "17", "21", "05"],  # Missouri (MO)
+        "30": ["38", "46", "56", "16", "41"],  # Montana (MT)
+        "31": ["46", "19", "29", "20", "08"],  # Nebraska (NE)
+        "32": ["06", "41", "16", "49", "04"],  # Nevada (NV)
+        "33": ["23", "50", "25", "36", "44"],  # New Hampshire (NH)
+        "34": ["36", "42", "10", "09", "24"],  # New Jersey (NJ)
+        "35": ["04", "08", "40", "48", "49"],  # New Mexico (NM)
+        "36": ["42", "34", "09", "25", "50"],  # New York (NY)
+        "37": ["51", "47", "45", "13", "21"],  # North Carolina (NC)
+        "38": ["30", "46", "27", "19", "55"],  # North Dakota (ND)
+        "39": ["42", "54", "21", "18", "26"],  # Ohio (OH)
+        "40": ["20", "29", "05", "48", "35"],  # Oklahoma (OK)
+        "41": ["53", "16", "32", "06", "30"],  # Oregon (OR)
+        "42": ["36", "34", "10", "24", "39"],  # Pennsylvania (PA)
+        "44": ["09", "25", "36", "33", "50"],  # Rhode Island (RI)
+        "45": ["37", "13", "12", "01", "47"],  # South Carolina (SC)
+        "46": ["38", "30", "56", "31", "19"],  # South Dakota (SD)
+        "47": ["21", "51", "37", "13", "01"],  # Tennessee (TN)
+        "48": ["35", "40", "05", "22", "08"],  # Texas (TX)
+        "49": ["32", "16", "56", "08", "04"],  # Utah (UT)
+        "50": ["33", "36", "25", "44", "09"],  # Vermont (VT)
+        "51": ["24", "54", "37", "47", "10"],  # Virginia (VA)
+        "53": ["41", "16", "30", "06", "32"],  # Washington (WA)
+        "54": ["39", "42", "51", "24", "21"],  # West Virginia (WV)
+        "55": ["27", "19", "17", "26", "18"],  # Wisconsin (WI)
+        "56": ["30", "46", "08", "49", "16"],  # Wyoming (WY)
+    }
+
 
     if Study_Year and Study_Year < 2016:
         db_path = os.path.join(MASTER_PATH, DATABASE_2010_FILE_NAME)
@@ -730,56 +782,89 @@ def EXTRACT_STUDIES_DATA(GET_API_DATA, LINK):
     else:
         select_query_cols = race_columns
 
-    select_query = (
-        "SELECT NAME," + ",".join(select_query_cols) + 
-        f" FROM {table_name} WHERE state=? AND county=? AND tract=? AND block=?;"
-    )
 
-    totals_dict = {col: 0 for col in race_columns}
-
+    print("locations:",len(LATS_AND_LONS_FOR_ALL_STUDY_LOCATIONS))
+    print("STATES PROCESSED:",PROCESSED_STATES)
+    print("STATES PROCESSED:",PROCESSED_STATES)
     for data in LATS_AND_LONS_FOR_ALL_STUDY_LOCATIONS:
+    
         location_start_time = time.perf_counter()
 
         lat, lon, address = data
+
         print(f"Processing demographic data for location: {address}")
-
-        latitude_and_longitude_pairs_in_67_mile_around_location = \
-            getting_the_lats_and_longs_within_radius(lat, lon, 67)
-        Geography_Codes_Of_Each_Lat_and_Lon_Pair_Around_Radius = \
-            asyncio.run(get_geography_codes(latitude_and_longitude_pairs_in_67_mile_around_location))
-
-        if not Geography_Codes_Of_Each_Lat_and_Lon_Pair_Around_Radius:
-            print(f"No geography codes found for location: {address}. Skipping this location.")
-            location_end_time = time.perf_counter()
-            print(f"Time for this location: {location_end_time - location_start_time:.2f} sec")
+        if "United States" not in address:
+            print("Skipping for locations outside the US....\n")
             continue
 
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        # Get blocks in radius using DuckDB
+        blocks_df = get_blocks_in_radius_locally(MERGED_FILE_PARQUET, lat, lon, 67)
 
-        # Each location must have 25 items (besides address) 
-        # because the final insert expects 26 total (1 for address + 25 totals).
-        location_totals = [0]*len(race_columns)
+        geography_codes = set(
+            (row["STATEFP20"], row["COUNTYFP20"], row["TRACTCE20"], row["BLOCKCE20"])
+            for _, row in blocks_df.iterrows()
+        )
 
-        for (state, county, tract, block) in Geography_Codes_Of_Each_Lat_and_Lon_Pair_Around_Radius:
-            cur.execute(select_query, (state, county, tract, block))
-            rows = cur.fetchall()
-            for row in rows:
-                # Accumulate each column if it exists in "row"
-                for i, col in enumerate(race_columns):
-                    if col in row.keys():  # real column
-                        val = row[col]
-                        val_int = 0
-                        if val is not None and str(val).strip() != "":
-                            val_int = int(float(val))
-                        location_totals[i] += val_int
-                        totals_dict[col] += val_int
-                    else:
-                        # It's a "fake" column (for 2010), just keep 0
-                        pass
+        location_totals = [0] * len(race_columns)
+        totals_dict = {col: 0 for col in race_columns}
 
-        conn.close()
+        async def get_near_state_data(address):
+            global PROCESSED_STATES
+            state = address.split(",")[-3].strip().lower()
+            print(state)
+            Study_state = us_states_fips[state]
+            states_to_query = neighboring_states_fips.get(Study_state, []) + [Study_state]
+            for state in states_to_query:
+                if state in PROCESSED_STATES:
+                    states_to_query.remove(state)
+            
+            
+
+            if not states_to_query:
+                return DEMOGRAPHIC_DICT
+            
+            PROCESSED_STATES = PROCESSED_STATES.union(set(states_to_query))
+            async with aiosqlite.connect(db_path) as db:
+                query = f"""
+                    SELECT NAME,{', '.join(select_query_cols)}, state, county, tract, block
+                    FROM {table_name}
+                    WHERE state IN ({','.join(['?'] * len(states_to_query))})
+                """
+                async with db.execute(query, states_to_query) as cursor:
+                    rows = await cursor.fetchall()  # Fetch all rows at once
+            # Convert rows to a dictionary for quick lookup
+
+            data_dict = {(row[-4], row[-3], row[-2], row[-1]): row[:-4] for row in rows}
+            DEMOGRAPHIC_DICT.update(data_dict)
+            
+            return DEMOGRAPHIC_DICT
+    
+        
+
+        async def process_data():
+            """Processes data using pre-fetched dictionary for faster lookups."""
+            data_dict = await get_near_state_data(address)  # Bulk fetch all data firs
+      
+
+
+            # Process relevant records using dictionary lookups (avoids DB queries)
+            for state, county, tract, block in geography_codes:
+                row = data_dict.get((state, county, tract, block), [0] * len(race_columns))  # Fast lookup
+
+                for i, val in enumerate(row):
+                    if i == 0:
+                        continue
+                    
+                    if val is not None and str(val).strip():
+                        
+                        val_int = int(float(val))
+                        location_totals[i-1] += val_int
+                        totals_dict[race_columns[i-1]] += val_int
+          
+        
+        
+        asyncio.run(process_data())
+        
 
         insert_data_into_location_db(address, location_totals)
 
