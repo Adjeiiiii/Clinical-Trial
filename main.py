@@ -32,8 +32,7 @@ ERROR_IDS_FILE_NAME = "ERROR_IDS.txt"
 MERGED_FILE_PARQUET = "merged_census_blocks.parquet"
 
 # GOOGLE_API_KEY = "AIzaSyAg5q9r2TxtijqmeFHcIDIbE5NCA7lnx8k"
-GOOGLE_API_KEY= "AIzaSyAHXnbcPeyi5SozWA5zgEpC7hMTh7XriOA"
-
+GOOGLE_API_KEY= ""
 DEMOGRAPHIC_DICT = {}
 
 
